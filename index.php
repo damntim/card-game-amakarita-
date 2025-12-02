@@ -9,10 +9,10 @@ $is_logged_in = isset($_SESSION['user_id']);
 
 // Database connection
 // Database connection
-$servername = "localhost";
-$username = "ypwpowvu_amakarita";
-$password = "QCu2LmWdGMRRdb6AnGjk";
-$dbname = "ypwpowvu_amakarita";
+$servername = "sql100.infinityfree.com";
+$username = "if0_40577586";
+$password = "amakarita123";
+$dbname = "if0_40577586_amakarita";
 
 // Create connection
 $conn = new mysqli($servername, $username, $password, $dbname);

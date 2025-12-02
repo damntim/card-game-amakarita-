@@ -1,6 +1,6 @@
 -- Create database if not exists
-CREATE DATABASE IF NOT EXISTS ypwpowvu_amakarita;
-USE ypwpowvu_amakarita;
+CREATE DATABASE IF NOT EXISTS if0_40577586_amakarita;
+USE if0_40577586_amakarita;
 
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
