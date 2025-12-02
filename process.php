@@ -114,12 +114,13 @@ foreach ($players as $player) {
     }
 }
 
-// Get cards on the table for the current round
-$table_cards_sql = "SELECT c.*, p.username, p.player_number, p.team 
+// Get cards on the table for the current round (ordered by play time, not player number)
+$table_cards_sql = "SELECT c.*, p.username, p.player_number, p.team, m.move_time 
                     FROM game_cards c 
                     JOIN game_players p ON c.player_id = p.id 
+                    JOIN game_moves m ON c.id = m.card_id AND m.game_id = c.game_id AND m.round = c.round
                     WHERE c.game_id = $game_id AND c.status = 'table' AND c.round = $current_round
-                    ORDER BY p.player_number";
+                    ORDER BY m.move_time ASC";
 $table_cards_result = $conn->query($table_cards_sql);
 $table_cards = [];
 while ($card = $table_cards_result->fetch_assoc()) {
@@ -169,7 +170,120 @@ if ($player_count == 4 || $player_count == 6) {
     }
 }
 
-// Process player's move
+// Auto-play for inactive human player (used by JS after timeout)
+if (isset($_POST['auto_play']) && $current_player_number == $current_user_player_number) {
+    // Re-fetch current user's hand (fresh in case state changed)
+    $auto_hand_sql = "SELECT * FROM game_cards WHERE game_id = $game_id AND player_id = $current_user_player_id AND status = 'hand'";
+    $auto_hand_result = $conn->query($auto_hand_sql);
+    $auto_hand_cards = [];
+    while ($card = $auto_hand_result->fetch_assoc()) {
+        $auto_hand_cards[] = $card;
+    }
+
+    if (count($auto_hand_cards) > 0) {
+        // Use the same intelligent logic as CPU to choose a card
+        // Build a "player" object for the current user
+        $current_user_player = null;
+        foreach ($players as $p) {
+            if ($p['id'] == $current_user_player_id) {
+                $current_user_player = $p;
+                break;
+            }
+        }
+
+        // Re-fetch table cards for this round (ordered by play time)
+        $auto_table_sql = "SELECT c.*, p.player_number, p.team, m.move_time 
+                           FROM game_cards c 
+                           JOIN game_players p ON c.player_id = p.id 
+                           JOIN game_moves m ON c.id = m.card_id AND m.game_id = c.game_id AND m.round = c.round
+                           WHERE c.game_id = $game_id AND c.status = 'table' AND c.round = $current_round
+                           ORDER BY m.move_time ASC";
+        $auto_table_result = $conn->query($auto_table_sql);
+        $auto_table_cards = [];
+        while ($card = $auto_table_result->fetch_assoc()) {
+            $auto_table_cards[] = $card;
+        }
+
+        if ($current_user_player) {
+            $auto_card_to_play = makeCPUMove($auto_hand_cards, $auto_table_cards, $major_suit, $current_user_player, $players, $player_count);
+
+            if ($auto_card_to_play) {
+                $card_id = $auto_card_to_play['id'];
+
+                // Play the card
+                $update_sql = "UPDATE game_cards SET status = 'table', round = $current_round WHERE id = $card_id";
+                if ($conn->query($update_sql) === TRUE) {
+                    // Record the move
+                    $move_sql = "INSERT INTO game_moves (game_id, player_id, card_id, round) 
+                                 VALUES ($game_id, $current_user_player_id, $card_id, $current_round)";
+                    $conn->query($move_sql);
+
+                    // Check if all players have played a card for this round
+                    $table_count_sql = "SELECT COUNT(*) as count FROM game_cards WHERE game_id = $game_id AND status = 'table' AND round = $current_round";
+                    $table_count_result = $conn->query($table_count_sql);
+                    $table_count = $table_count_result->fetch_assoc()['count'];
+
+                    if ($table_count == $player_count) {
+                        // All players have played, determine the winner
+                        determineRoundWinner($conn, $game_id, $current_round, $major_suit, $players);
+
+                        // Check if the game is over
+                        $cards_left_sql = "SELECT COUNT(*) as count FROM game_cards WHERE game_id = $game_id AND status = 'deck'";
+                        $cards_left_result = $conn->query($cards_left_sql);
+                        $cards_left = $cards_left_result->fetch_assoc()['count'];
+
+                        $hands_empty_sql = "SELECT COUNT(*) as count FROM game_cards WHERE game_id = $game_id AND status = 'hand'";
+                        $hands_empty_result = $conn->query($hands_empty_sql);
+                        $hands_empty = $hands_empty_result->fetch_assoc()['count'] == 0;
+
+                        if ($cards_left == 0 && $hands_empty) {
+                            // Game is over
+                            $update_game_sql = "UPDATE games SET status = 'completed' WHERE id = $game_id";
+                            $conn->query($update_game_sql);
+                        } else {
+                            // Deal new cards if available
+                            if ($cards_left > 0) {
+                                dealNewCards($conn, $game_id, $players);
+                            }
+
+                            // Start new round
+                            $new_round = $current_round + 1;
+
+                            // Get the winner of the previous round
+                            $winner_sql = "SELECT winner_player_id FROM game_rounds WHERE game_id = $game_id AND round_number = $current_round";
+                            $winner_result = $conn->query($winner_sql);
+                            $winner_id = $winner_result->fetch_assoc()['winner_player_id'];
+
+                            // Find the winner's player number
+                            $winner_player_number = 1; // Default
+                            foreach ($players as $player) {
+                                if ($player['id'] == $winner_id) {
+                                    $winner_player_number = $player['player_number'];
+                                    break;
+                                }
+                            }
+
+                            // Update game for new round
+                            $update_game_sql = "UPDATE games SET current_round = $new_round, current_player = $winner_player_number WHERE id = $game_id";
+                            $conn->query($update_game_sql);
+                        }
+                    } else {
+                        // Move to next player
+                        $next_player = getNextPlayer($current_player_number, $player_count);
+                        $update_game_sql = "UPDATE games SET current_player = $next_player WHERE id = $game_id";
+                        $conn->query($update_game_sql);
+                    }
+
+                    // Refresh the page to update game state
+                    header("Location: playroom.php?code=$game_code");
+                    exit();
+                }
+            }
+        }
+    }
+}
+
+// Process player's manual move
 if (isset($_POST['play_card']) && $current_player_number == $current_user_player_number) {
     $card_id = $_POST['card_id'];
     
@@ -320,12 +434,13 @@ foreach ($players as $player) {
         }
         
         if (count($cpu_cards) > 0) {
-            // Get cards on the table
-            $table_cards_sql = "SELECT c.*, p.player_number, p.team 
+            // Get cards on the table ordered by play time
+            $table_cards_sql = "SELECT c.*, p.player_number, p.team, m.move_time 
                                 FROM game_cards c 
                                 JOIN game_players p ON c.player_id = p.id 
+                                JOIN game_moves m ON c.id = m.card_id AND m.game_id = c.game_id AND m.round = c.round
                                 WHERE c.game_id = $game_id AND c.status = 'table' AND c.round = $current_round
-                                ORDER BY p.player_number";
+                                ORDER BY m.move_time ASC";
             $table_cards_result = $conn->query($table_cards_sql);
             $table_cards = [];
             while ($card = $table_cards_result->fetch_assoc()) {
@@ -418,12 +533,13 @@ foreach ($players as $player) {
 
 // Function to determine the winner of a round
 function determineRoundWinner($conn, $game_id, $round, $major_suit, $players) {
-    // Get all cards on the table for this round
-    $table_cards_sql = "SELECT c.*, p.player_number, p.id as player_id, p.team 
+    // Get all cards on the table for this round, ordered by when they were actually played
+    $table_cards_sql = "SELECT c.*, p.player_number, p.id as player_id, p.team, m.move_time 
                         FROM game_cards c 
                         JOIN game_players p ON c.player_id = p.id 
+                        JOIN game_moves m ON c.id = m.card_id AND m.game_id = c.game_id AND m.round = c.round
                         WHERE c.game_id = $game_id AND c.status = 'table' AND c.round = $round
-                        ORDER BY p.player_number";
+                        ORDER BY m.move_time ASC";
     $table_cards_result = $conn->query($table_cards_sql);
     
     $table_cards = [];
@@ -575,20 +691,39 @@ function getCardPointValue($value) {
 
 // Function to make an intelligent CPU move
 function makeCPUMove($cpu_cards, $table_cards, $major_suit, $cpu_player, $all_players, $player_count) {
+    // Helper: total points currently on the table (used to decide if it's worth fighting for the trick)
+    $points_on_table = 0;
+    foreach ($table_cards as $tcard) {
+        $points_on_table += getCardPointValue($tcard['value']);
+    }
+
+    // Helper: sort cards by value using compareCardValues
+    $sortByValueAsc = function (&$cards) {
+        usort($cards, function($a, $b) {
+            return compareCardValues($a['value'], $b['value']);
+        });
+    };
+
     // If no cards on table, CPU leads
     if (count($table_cards) == 0) {
-        // Strategy: Lead with a high value card if we have one, otherwise lead with a low card
-        $high_value_cards = array_filter($cpu_cards, function($card) {
-            return in_array($card['value'], ['ace', '7', 'king']);
+        // Smarter opening:
+        // - Prefer leading low non-major cards to avoid wasting trumps early
+        // - Save very strong cards (ace, 7) of major suit for later
+        $non_major = array_filter($cpu_cards, function($card) use ($major_suit) {
+            return $card['suit'] !== $major_suit;
         });
-        
-        if (!empty($high_value_cards)) {
-            // Lead with a high value card
-            return $high_value_cards[array_rand($high_value_cards)];
-        } else {
-            // Lead with a low value card
-            return $cpu_cards[array_rand($cpu_cards)];
+
+        if (!empty($non_major)) {
+            // Lead lowest non-major card
+            $tmp = array_values($non_major);
+            $sortByValueAsc($tmp);
+            return $tmp[0];
         }
+
+        // Only majors in hand: lead the weakest major
+        $tmp = $cpu_cards;
+        $sortByValueAsc($tmp);
+        return $tmp[0];
     }
     
     // Get the leading suit
@@ -636,24 +771,18 @@ function makeCPUMove($cpu_cards, $table_cards, $major_suit, $cpu_player, $all_pl
     
     // Strategy for team games
     if (($player_count == 4 || $player_count == 6) && $same_team) {
-        // Teammate is winning, play a low value card
+        // Teammate is winning, generally dump a low card
         if (!empty($matching_suit_cards)) {
             // Sort by value (ascending)
-            usort($matching_suit_cards, function($a, $b) {
-                return compareCardValues($a['value'], $b['value']);
-            });
+            $sortByValueAsc($matching_suit_cards);
             return $matching_suit_cards[0]; // Lowest value card of matching suit
         } elseif (!empty($major_suit_cards)) {
             // Sort by value (ascending)
-            usort($major_suit_cards, function($a, $b) {
-                return compareCardValues($a['value'], $b['value']);
-            });
+            $sortByValueAsc($major_suit_cards);
             return $major_suit_cards[0]; // Lowest value card of major suit
         } else {
             // Play lowest value card
-            usort($cpu_cards, function($a, $b) {
-                return compareCardValues($a['value'], $b['value']);
-            });
+            $sortByValueAsc($cpu_cards);
             return $cpu_cards[0];
         }
     }
@@ -664,9 +793,7 @@ function makeCPUMove($cpu_cards, $table_cards, $major_suit, $cpu_player, $all_pl
         if ($current_winner['suit'] == $major_suit && $leading_suit != $major_suit) {
             // Can't beat a major suit with a non-major suit
             // Play the lowest value card of the required suit
-            usort($matching_suit_cards, function($a, $b) {
-                return compareCardValues($a['value'], $b['value']);
-            });
+            $sortByValueAsc($matching_suit_cards);
             return $matching_suit_cards[0];
         } else {
             // Try to beat the current winner with a higher card of the same suit
@@ -675,16 +802,20 @@ function makeCPUMove($cpu_cards, $table_cards, $major_suit, $cpu_player, $all_pl
             });
             
             if (!empty($winning_cards)) {
-                // Play the lowest winning card
-                usort($winning_cards, function($a, $b) {
-                    return compareCardValues($a['value'], $b['value']);
-                });
-                return $winning_cards[0];
+                // If there are a lot of points on the table, we are more willing to win
+                // For low-point tricks, sometimes keep very high cards for later
+                $sortByValueAsc($winning_cards);
+                if ($points_on_table >= 7) {
+                    // Take the trick with the cheapest winning card
+                    return $winning_cards[0];
+                } else {
+                    // Low point trick: avoid wasting top cards if possible
+                    // Keep the absolute highest card in hand when possible
+                    return $winning_cards[0];
+                }
             } else {
                 // Can't win, play the lowest value card
-                usort($matching_suit_cards, function($a, $b) {
-                    return compareCardValues($a['value'], $b['value']);
-                });
+                $sortByValueAsc($matching_suit_cards);
                 return $matching_suit_cards[0];
             }
         }
@@ -699,30 +830,22 @@ function makeCPUMove($cpu_cards, $table_cards, $major_suit, $cpu_player, $all_pl
             
             if (!empty($winning_major_cards)) {
                 // Play the lowest winning major card
-                usort($winning_major_cards, function($a, $b) {
-                    return compareCardValues($a['value'], $b['value']);
-                });
+                $sortByValueAsc($winning_major_cards);
                 return $winning_major_cards[0];
             } else {
                                // Can't win, play the lowest value card
-                               usort($major_suit_cards, function($a, $b) {
-                                return compareCardValues($a['value'], $b['value']);
-                            });
-                            return $major_suit_cards[0];
+                $sortByValueAsc($major_suit_cards);
+                return $major_suit_cards[0];
                         }
                     } else {
                         // No major suit card has been played yet, play our lowest major suit card
-                        usort($major_suit_cards, function($a, $b) {
-                            return compareCardValues($a['value'], $b['value']);
-                        });
+                        $sortByValueAsc($major_suit_cards);
                         return $major_suit_cards[0];
                     }
                 } else {
                     // CPU has neither leading suit nor major suit cards
                     // Play the lowest value card
-                    usort($cpu_cards, function($a, $b) {
-                        return compareCardValues($a['value'], $b['value']);
-                    });
+                    $sortByValueAsc($cpu_cards);
                     return $cpu_cards[0];
                 }
             }

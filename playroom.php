@@ -401,6 +401,11 @@ include 'process.php';
                     const chatContainer = document.querySelector('.chat-container');
                     const chatClose = document.querySelector('.chat-close');
                     
+                    // Auto-play configuration
+                    const isHumanTurn = <?php echo ($current_player_number == $current_user_player_number && !$game_over) ? 'true' : 'false'; ?>;
+                    const autoPlayTimeoutMs = 15000; // 15 seconds
+                    let autoPlayTimer = null;
+                    
                     // Fetch players for @mentions
                     function fetchPlayers() {
                         fetch(`chat_process.php?action=players&game_code=${gameCode}`)
@@ -666,6 +671,28 @@ include 'process.php';
                             chatClose.addEventListener('click', function() {
                                 chatContainer.classList.remove('active');
                             });
+                        }
+
+                        // Auto-play timer for multi-player human turns
+                        if (isHumanTurn) {
+                            // Start a 15s timer; if player doesn't play, auto-play on server
+                            autoPlayTimer = setTimeout(function() {
+                                // Send a POST request to trigger auto-play
+                                fetch('playroom.php?code=' + encodeURIComponent(gameCode), {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/x-www-form-urlencoded'
+                                    },
+                                    body: 'auto_play=1'
+                                }).then(function() {
+                                    // After auto-play, reload to reflect new state
+                                    window.location.reload();
+                                }).catch(function(err) {
+                                    console.error('Auto-play failed:', err);
+                                });
+                            }, autoPlayTimeoutMs);
+
+                            // If user manually plays a card, the page will reload and cancel this timer naturally.
                         }
                     });
                 </script>
